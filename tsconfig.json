@@ -9,6 +9,10 @@
     "preserveConstEnums": true,
     "outDir": "dist"
   },
+  "include": [
+    "*.ts",
+    "**/*.ts"
+  ],
   "exclude": [
     "node_modules"
   ]
