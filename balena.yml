@@ -1,0 +1,186 @@
+# balena.yml — relayEquipmentManager (REM) standalone application
+#
+# Mirrors AQB-011 (poolController) balena manifest pattern. AQB-011 deploys
+# poolController as a single-service `sw.application`; this manifest does the
+# same for REM on customer Pis where the poolController is hosted elsewhere
+# (e.g. on the Aqua Swarm gateway) and the on-site Pi only needs the relay
+# hardware control plane.
+#
+# When REM runs alongside poolController in the AquaButlers multi-service
+# fleet, the per-service block lives in `aquabutlers-fleet/balena.yml`
+# instead — same fields, same device bindings, different host.
+#
+# Image reference: pinned to a SHA tag built from the Dockerfile in this
+# repo (multi-arch: amd64, arm64, arm/v7). Until the OpenBalena registry is
+# mirrored (see t_6cae4233), the build pipeline pushes to
+# `ghcr.io/ultron-aquabutler/relay-equipment-manager:sha-<commit>` and the
+# balena CLI on Bryan's dev box pulls directly from GHCR.
+
+name: relay-equipment-manager
+type: sw.application
+description: >-
+  Relay Equipment Manager — GPIO / I2C / SPI / 1-Wire relay and sensor
+  control plane for AquaButler CPE. Standalone Balena application; runs on
+  customer Pis where poolController is hosted remotely.
+assets:
+  repository:
+    type: blob.asset
+    data:
+      url: "https://github.com/ultron-aquabutler/AquaButler-Control-REM.git"
+  logo:
+    type: blob.asset
+    data:
+      url: "https://github.com/ultron-aquabutler/AquaButler-Control-REM/assets/favicon.ico"
+data:
+  applicationEnvironmentVariables:
+    # TZ is intentionally site-specific — left blank here; set per-device
+    # in the balena dashboard so the same image serves every customer.
+    - TZ: ""
+    # NODE_ENV=production is baked into the prod-stage Dockerfile; left here
+    # as a reference. Override per-device only for staging/debug.
+    - NODE_ENV: "production"
+    # MQTT broker URL — defaults to in-fleet mosquitto when REM is part of
+    # the AquaButlers multi-service fleet; override per-device for an
+    # external broker.
+    - MQTT_BROKER_URL: "mqtt://mqtt:1883"
+  defaultDeviceType: raspberrypi4-64
+  supportedDeviceTypes:
+    - raspberrypi4-64
+    - raspberrypi3
+    - raspberrypi3-64
+    - raspberrypizero2w-64
+version: 1.0.0
+
+# ===========================================================================
+# Service-level deployment config
+# ===========================================================================
+# v2 services: block. Same surface as AQB-011 fleet's poolController entry —
+# host port mappings, persistent volumes, hardware device bindings,
+# healthcheck, per-device env surface.
+services:
+  relayEquipmentManager:
+    # Prebuilt image — `balena push` will pull this from GHCR rather than
+    # rebuilding from source. If a future deployment needs a custom build
+    # (e.g. extra native modules), drop the `image:` here and add a
+    # `build:` block pointing at the current directory.
+    image: ghcr.io/ultron-aquabutler/relay-equipment-manager:sha-58f63df
+    # Public hostname Balena assigns in the device dashboard / local DNS.
+    hostname: rem
+    # Run as the unprivileged `node` user (matches Dockerfile prod stage;
+    # native GPIO/I2C/SPI access is granted via the `devices:` block below,
+    # not via root).
+    user: node
+    # Keep running across crashes; supervisor restarts on exit.
+    restart: always
+    # Expose REM's HTTP + HTTPS servers (defaultConfig.json -> web.servers.*).
+    # Port 8080 is the HTTP UI / REST API / Socket.IO endpoint. Port 8081 is
+    # HTTPS (only used when web.servers.https.enabled=true). UDP 1900 is
+    # SSDP / UPnP discovery (web.servers.ssdp.enabled=true by default).
+    ports:
+      - "8080:8080/tcp"   # REM HTTP UI / REST / Socket.IO
+      - "8081:8081/tcp"   # REM HTTPS (opt-in)
+      - "1900:1900/udp"   # REM UPnP / SSDP discovery
+    # Persistent storage on the device's balena-supervisor volume. Named
+    # volumes (declared below) survive OTA updates and host reboots.
+    volumes:
+      - "rem-data:/app/data"            # relay state, schedules, equipment snapshots
+      - "rem-config:/app/config.json"   # editable from balena file browser
+      - "rem-logs:/app/logs"            # rolling logs
+      - "rem-backups:/app/backups"      # auto-backup archives
+    # =========================================================================
+    # Hardware device bindings — REM's GPIO / I2C / SPI / 1-Wire surface
+    # =========================================================================
+    # REM is a HAT-stack relay/sensor controller, NOT a serial-bus device.
+    # It exposes:
+    #   - GPIO via libgpiod / onoff              (/dev/gpiomem, /dev/gpiochip0)
+    #   - I2C bus 1 (default Raspberry Pi HAT)   (/dev/i2c-1)
+    #   - SPI bus 0 for Sequent HAT ADC          (/dev/spidev0.0, /dev/spidev0.1)
+    #   - 1-Wire for DS18B20 temperature probes  (/sys/bus/w1)
+    # RS-485 (/dev/ttyUSB*) is intentionally NOT bound here — poolController
+    # owns the RS-485 bus on the same site. If a future REM variant needs
+    # RS-485 (e.g. MEGA-IND modbus), add it here AND coordinate bus
+    # arbitration with poolController's balena.yml.
+    devices:
+      - "/dev/gpiomem:/dev/gpiomem"
+      - "/dev/gpiochip0:/dev/gpiochip0"
+      - "/dev/i2c-1:/dev/i2c-1"
+      - "/dev/spidev0.0:/dev/spidev0.0"
+      - "/dev/spidev0.1:/dev/spidev0.1"
+      - "/sys/bus/w1:/sys/bus/w1"
+    # Service-level env. Per-site overrides land in device variables
+    # (NOT in this manifest) so a single base image serves every
+    # customer Pi. See `docs/balena.md` for the device-variable surface.
+    environment:
+      # Geolocation is site-specific — left blank here on purpose.
+      # Set TZ in the device dashboard per customer.
+      - "TZ=UTC"
+      - "NODE_ENV=production"
+      # UDEV=1 is baked into the prod-stage Dockerfile (UDEV env triggers
+      # onoff / spi-device to use libudev for device discovery instead of
+      # hardcoded paths). Restated here as a service-level env so a
+      # container restart picks it up even if the image is rebuilt without
+      # the ENV instruction.
+      - "UDEV=1"
+      # Default MQTT broker. Standalone REM fleets point this at an external
+      # broker (e.g. mqtts://mosquitto.loc.wallacearizona.us:8883); the
+      # AquaButlers multi-service fleet overrides at runtime.
+      - "MQTT_BROKER_URL=mqtt://mqtt:1883"
+    # Balena supervisor pings this URL on the device for liveness.
+    # REM's Express server answers GET / with the dashboard HTML, same
+    # surface as poolController. Compose-level healthcheck in the
+    # AquaButlers fleet reuses this same endpoint.
+    healthcheck:
+      interval: 60s
+      timeout: 8s
+      start_period: 60s
+      retries: 4
+      path: /
+      port: 8080
+    labels:
+      - "io.balena.features.supervisor-api=1.2.0"
+      - "io.balena.features.balena-api=1.2.0"
+      - "io.balena.features.device-plugin=1.2.0"
+      - "org.opencontainers.image.title=relay-equipment-manager"
+      - "org.opencontainers.image.description=Relay Equipment Manager for AquaButler CPE — GPIO/I2C/SPI/1-Wire relay and sensor control"
+      - "org.opencontainers.image.source=https://github.com/ultron-aquabutler/AquaButler-Control-REM"
+      - "org.opencontainers.image.licenses=AGPL-3.0-only"
+
+# ===========================================================================
+# Device variables (per-customer Pi overrides)
+# ===========================================================================
+# Per the AQB-011 spec, balena device variables override the service-level
+# environment. Documented here for the operator; values are SET via the
+# balena dashboard per-device, not in this manifest. List them so the
+# dashboard "Add device variable" UI surfaces them as suggestions on new
+# device provisioning.
+#
+#   TZ                       Site timezone (e.g. America/Phoenix). Used by
+#                            REM's scheduler for sunrise/sunset + schedule
+#                            windows.
+#
+#   MQTT_BROKER_URL          Override the broker address; defaults to
+#                            the in-fleet mqtt:1883 from the v1
+#                            applicationEnvironmentVariables.
+#
+#   BALENA_DEVICE_I2C_BUS    Override the I2C bus device node (default
+#                            /dev/i2c-1). Set to /dev/i2c-0 if your
+#                            HAT stack pins to bus 0.
+#
+#   BALENA_DEVICE_SPI_BUS    Override the SPI bus device nodes (default
+#                            /dev/spidev0.0, /dev/spidev0.1).
+#
+#   BALENA_DEVICE_GPIOCHIP   Override the GPIO chip device node (default
+#                            /dev/gpiochip0). Useful on Pi 5 where the
+#                            legacy /dev/gpiomem interface is deprecated
+#                            in favor of the gpiochip character device.
+
+# ===========================================================================
+# Named volumes — persistent storage for the relayEquipmentManager service
+# ===========================================================================
+# Volumes map onto the device's persistent storage managed by
+# balena-supervisor. They survive OTA updates and host reboots.
+volumes:
+  rem-data:
+  rem-config:
+  rem-logs:
+  rem-backups:
