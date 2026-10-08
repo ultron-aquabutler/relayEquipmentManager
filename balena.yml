@@ -1,0 +1,128 @@
+# balena.yml — fleet / application manifest for relayEquipmentManager (REM)
+# Loaded by `balena push <fleet>` or by open-balena on self-hosted fleets.
+# Reference: https://docs.balena.io/reference/balena.yml/
+#
+# Mirrors the AQB-013 pattern from ultron-aquabutler/relayEquipmentManager.
+# Single-service application: REM serves the relay/sensor HTTP API + web UI
+# and is a companion service to njsPC. It does NOT touch the Pentair serial
+# bus (that's poolController's job) — REM owns the GPIO / I2C / SPI stack
+# (Sequent HAT-style relay boards, ADS1x15 ADCs, pH/ORP/temperature probes,
+# watchdog, etc.).
+#
+# Companion service: poolController on the same fleet. RESOLVED OVER THE
+# BALENA LAN at hostname `poolcontroller` (balena's local DNS auto-wires
+# sibling service hostnames). REM publishes telemetry to MQTT_BROKER_URL
+# which defaults to the in-fleet `mqtt:1883` broker.
+
+buildkit:
+  # Compose-style network so the GHCR base image can be pulled during build.
+  network: host
+
+# Images built by `balena build` are tagged into this image registry path.
+# Bryan normally pushes to ghcr.io/ultron-aquabutler — balena ignores this if
+# pushing into the balena/balena-cloud registry instead.
+images:
+  application: ghcr.io/ultron-aquabutler/relay-equipment-manager
+  # Optional: pin a fleet-specific tag here when open-balena is in use.
+
+# Single-service application. REM serves the HTTP(S) UI + REST + Socket.IO
+# API and is reached over the balena-managed LAN. Pools it manages live on
+# a sibling service or the same Pi (label-driven deployments, see
+# AquaButler-Server/fleet/cpe-stack.yml for the legacy Swarm equivalent).
+services:
+  relayEquipmentManager:
+    # Build context = repo root; use the existing multi-stage Dockerfile.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Build-args surfaced so balena OS / arch specific tweaks can happen
+      # without forking the Dockerfile per device.
+      args:
+        - NODE_VERSION=20
+    # Public hostname balena assigns in the device dashboard / local DNS.
+    hostname: rem
+    # Run as the unprivileged `node` user (matches Dockerfile USER node).
+    user: node
+    # Keep running across crashes; supervisor restarts on exit.
+    restart: always
+    # Expose UI + REST + Socket.IO + SSDP on the device's LAN. Host ports
+    # sourced from defaultConfig.json -> web.servers.* and from the SSDP
+    # announcer (UDP 1900) for UPnP discovery.
+    #   8080  HTTP UI / REST / Socket.IO
+    #   8081  HTTPS (only used if web.servers.https.enabled)
+    #   1900  SSDP / UPnP discovery (UDP)
+    ports:
+      - "8080:8080/tcp"   # web UI / REST / Socket.IO
+      - "8081:8081/tcp"   # HTTPS (only used if config enables it)
+      - "1900:1900/udp"   # SSDP / UPnP discovery
+    # Persistent data on the device's balena-supervisor volume, not the host fs.
+    volumes:
+      - "rem-data:/app/data"
+      - "rem-logs:/app/logs"
+      - "rem-backups:/app/backups"
+      # config.json is editable from the host via balena's file browser; bind
+      # a named volume so changes survive `balena push` OTA updates.
+      - "rem-config:/app/config.json:rw"
+    # Hardware device bindings — REM is a HAT-stack relay/sensor controller.
+    # RS-485 is intentionally absent (poolController owns the Pentair bus).
+    #   /dev/gpiomem     GPIO character device (Pi 4/5 unified GPIO)
+    #   /dev/gpiochip0   libgpiod-style GPIO chip handle
+    #   /dev/i2c-1       I2C bus 1 (ADS1x15 ADC, Sequent HAT)
+    #   /dev/spidev0.0   SPI bus 0 CE0 (ADS1x15 alt + Sequent IO)
+    #   /dev/spidev0.1   SPI bus 0 CE1 (Sequent Watchdog)
+    #   /sys/class/...   1-Wire filesystem (DS18B20 temp probes, optional)
+    devices:
+      - "/dev/gpiomem:/dev/gpiomem"
+      - "/dev/gpiochip0:/dev/gpiochip0"
+      - "/dev/i2c-1:/dev/i2c-1"
+      - "/dev/spidev0.0:/dev/spidev0.0"
+      - "/dev/spidev0.1:/dev/spidev0.1"
+      - "/sys/bus/w1/devices:/sys/bus/w1/devices"
+    # Service-level environment variables. Bryan can override per device in
+    # the balena dashboard → Device Variables. Defaults below assume REM is
+    # running alongside a sibling poolController on the balena LAN.
+    environment:
+      # In-fleet MQTT broker; mirror of aquabutlers-mqtt-bridge service hostname.
+      - "MQTT_BROKER_URL=mqtt://mqtt:1883"
+      # Geolocation is site-specific; left blank here on purpose.
+      # Set TZ in the balena device dashboard if your customer timezone differs.
+      - "TZ=UTC"
+      - "NODE_ENV=production"
+      - "UDEV=1"
+    # Balena supervisor pings this URL on the device for liveness. REM's
+    # Express app responds 200 to GET / (the web UI). The healthcheck
+    # matches what the legacy Swarm stack uses.
+    healthcheck:
+      interval: 60s
+      timeout: 8s
+      start_period: 60s
+      retries: 4
+      path: /
+      port: 8080
+    # Image labels — balena uses these in the fleet dashboard.
+    labels:
+      - "io.balena.qemu.version=8.0.0-rc8+qemu-7.2"
+      - "io.balena.features.supervisor-api=1.2.0"
+      - "io.balena.features.balena-api=1.2.0"
+      - "io.balena.features.device-plugin=1.2.0"
+      - "org.opencontainers.image.title=relay-equipment-manager"
+      - "org.opencontainers.image.description=Relay Equipment Manager — GPIO/I2C/SPI relay and sensor control. AquaButler fleet member, balena build for Raspberry Pi 4/5."
+      - "org.opencontainers.image.source=https://github.com/ultron-aquabutler/relayEquipmentManager"
+      - "org.opencontainers.image.licenses=AGPL-3.0-only"
+
+# Named volumes map onto the device's persistent storage managed by
+# balena-supervisor. They survive OTA updates and host reboots.
+volumes:
+  rem-data:
+  rem-logs:
+  rem-backups:
+  rem-config:
+
+# Override device-types Bryan cares about. balena's default fleet type is
+# raspberry-pi; the build will produce a manifest that works on every Pi
+# family supported by balenaOS (Pi 3, 4, Zero 2 W, 5). If a future fleet
+# needs Jetson Nano or amd64 gateway boxes, add deviceTypes below.
+# deviceTypes:
+#   - raspberrypi4-64
+#   - raspberrypi3
+#   - raspberrypizero2w-64
